@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="utf-8"?>
+<search>
+  <entry>
+    <title>Flink中的反压原理</title>
+    <url>/2022/12/18/Flink%E4%B8%AD%E7%9A%84%E5%8F%8D%E5%8E%8B%E5%8E%9F%E7%90%86/</url>
+    <content><![CDATA[<h2 id="Flink中反压机制"><a href="#Flink中反压机制" class="headerlink" title="Flink中反压机制"></a>Flink中反压机制</h2><h3 id="Flink中数据流向"><a href="#Flink中数据流向" class="headerlink" title="Flink中数据流向"></a>Flink中数据流向</h3><img src="/.com//12/18/Flink%E4%B8%AD%E7%9A%84%E5%8F%8D%E5%8E%8B%E5%8E%9F%E7%90%86/%E6%95%B0%E6%8D%AE%E6%B5%81%E5%90%91-1687076283833-1.webp" class title="数据流向">
+
+<p>上图是Flink自身在做网络传输的时候的基本流向，发送端在发送网络数据的时候要经历自己内部一个流程，会有一个自己的NetWord Buffer，使用Netty来通信，Netty这一层有属于自己的ChannelOutbound Buffer，因为Flink最终要使用Socket做网络请求发送数据，所以在Socket也有自己的Send Buffer，同时在接收端也有对应的Buffer。在Flink1.5之前是使用TCP流控制实现反压。</p>
+<h3 id="TCP机制"><a href="#TCP机制" class="headerlink" title="TCP机制"></a>TCP机制</h3><img src="/.com//12/18/Flink%E4%B8%AD%E7%9A%84%E5%8F%8D%E5%8E%8B%E5%8E%9F%E7%90%86/tcp%E6%9C%BA%E5%88%B6.webp" class title="tcp机制">
+
+<h4 id="Tcp结构"><a href="#Tcp结构" class="headerlink" title="Tcp结构"></a>Tcp结构</h4><p>​		<strong>Sequence number：</strong>这样一个机制给每个数据包做一个编号</p>
+<p>​		<strong>ACK number：</strong>这样一个机制来确保 TCP 的数据传输是可靠的</p>
+<p>​		<strong>Window Size：</strong>接收端在回复消息的时候会通过 Window Size 告诉发送端还可以发送多少数据。</p>
+<h4 id="TCP-流控：滑动窗口"><a href="#TCP-流控：滑动窗口" class="headerlink" title="TCP 流控：滑动窗口"></a>TCP 流控：滑动窗口</h4><img src="/.com//12/18/Flink%E4%B8%AD%E7%9A%84%E5%8F%8D%E5%8E%8B%E5%8E%9F%E7%90%86/TCP%E6%BB%91%E5%8A%A8%E7%AA%97%E5%8F%A3.webp" class title="TCP滑动窗口">
+
+<p>TCP的流控制基于滑动窗口，如上图我们有一个发送端跟接收端，发送端的速率是我们接收端的3倍，假定我们初始发送的window大小是3，我们接收window大小是5。</p>
+<img src="/.com//12/18/Flink%E4%B8%AD%E7%9A%84%E5%8F%8D%E5%8E%8B%E5%8E%9F%E7%90%86/TCP%E6%BB%91%E5%8A%A8%E7%AA%97%E5%8F%A301.webp" class title="TCP滑动窗口01">
+
+<p>发送端先发送3个packets，将1，2，3发送给接收端，接收端收到之后将这三条数据放入到Buffer中</p>
+<img src="/.com//12/18/Flink%E4%B8%AD%E7%9A%84%E5%8F%8D%E5%8E%8B%E5%8E%9F%E7%90%86/TCP%E6%BB%91%E5%8A%A8%E7%AA%97%E5%8F%A302.webp" class title="TCP滑动窗口02">
+
+<p>发送端继续发送4，5，6，接收端继续接收4，5，6到Buffer中，然后消费1。<img src="/.com//12/18/Flink%E4%B8%AD%E7%9A%84%E5%8F%8D%E5%8E%8B%E5%8E%9F%E7%90%86/TCP%E6%BB%91%E5%8A%A8%E7%AA%97%E5%8F%A303.webp" class title="TCP滑动窗口03"></p>
+<p>接收端消费2数据，Buffer中还只能给存放一个数据，接收端给发送端一个ACK&#x3D;7、window&#x3D;1的标识，发送端收到之后，知道接收端窗口中只能接收一条数据，只会发送一个7数据到接收端的window中，这样限速就达到了</p>
+<img src="/.com//12/18/Flink%E4%B8%AD%E7%9A%84%E5%8F%8D%E5%8E%8B%E5%8E%9F%E7%90%86/TCP%E6%BB%91%E5%8A%A8%E7%AA%97%E5%8F%A304.webp" class title="TCP滑动窗口04">
+
+<img src="/.com//12/18/Flink%E4%B8%AD%E7%9A%84%E5%8F%8D%E5%8E%8B%E5%8E%9F%E7%90%86/TCP%E6%BB%91%E5%8A%A8%E7%AA%97%E5%8F%A305.webp" class title="TCP滑动窗口05">
+
+
+
+<p>上俩张图的情况是发送端发送7的数据，接收端接收到之后，因为种种原因未能消费数据，导致window一直是占满的情况。此时接收端会给发送端发送ACK&#x3D;8，window&#x3D;0的标识，此时发送端不在发送数据，发送端的发送速率就降到了0。此时发送端不发送数据，接收端不反馈数据，那么发送端如何知道何时才可以发送数据呢？</p>
+<img src="/.com//12/18/Flink%E4%B8%AD%E7%9A%84%E5%8F%8D%E5%8E%8B%E5%8E%9F%E7%90%86/TCP%E6%BB%91%E5%8A%A8%E7%AA%97%E5%8F%A306.webp" class title="TCP滑动窗口06">
+
+<img src="/.com//12/18/Flink%E4%B8%AD%E7%9A%84%E5%8F%8D%E5%8E%8B%E5%8E%9F%E7%90%86/TCP%E6%BB%91%E5%8A%A8%E7%AA%97%E5%8F%A307.webp" class title="TCP滑动窗口07">
+
+<img src="/.com//12/18/Flink%E4%B8%AD%E7%9A%84%E5%8F%8D%E5%8E%8B%E5%8E%9F%E7%90%86/TCP%E6%BB%91%E5%8A%A8%E7%AA%97%E5%8F%A308.webp" class title="TCP滑动窗口08">
+
+<p>TCP中有一个ZeroWindowProbe机制，发送端会定期的发送1个字节的探测消息，这个时候接收端就会把window的大小进行反馈。当接收端消费恢复之后，发送端就会接受到接收端的反馈，从而恢复整个流程。</p>
+<h2 id="Flink-TCP-based-反压机制"><a href="#Flink-TCP-based-反压机制" class="headerlink" title="Flink TCP-based 反压机制"></a>Flink TCP-based 反压机制</h2><img src="/.com//12/18/Flink%E4%B8%AD%E7%9A%84%E5%8F%8D%E5%8E%8B%E5%8E%9F%E7%90%86/%E5%8F%8D%E5%8E%8B%E4%BC%A0%E6%92%AD.webp" class title="反压传播">
+
+<p>Flink反压问题出现在俩个方面:</p>
+<ul>
+<li><p>跨 TaskManager ，反压如何从 InputGate 传播到 ResultPartition</p>
+</li>
+<li><p>TaskManager 内，反压如何从 ResultPartition 传播到 InputGate</p>
+</li>
+</ul>
+<h3 id="跨-TaskManager"><a href="#跨-TaskManager" class="headerlink" title="跨 TaskManager"></a>跨 TaskManager</h3><img src="/.com//12/18/Flink%E4%B8%AD%E7%9A%84%E5%8F%8D%E5%8E%8B%E5%8E%9F%E7%90%86/%E8%B7%A8TaskManager01.webp" class title="跨TaskManager01">
+
+<p>从上图可知TaskManager A给TaskManager B发送数据，TaskManager A做为Producer，TaskManager B做为Consumer。Producer处理完的数据首先输出到Producer对应的NetWork Buffer中，NetWorkBuffer就是图中的ResultSubPartition和InputChannel。</p>
+<p>ResultSubPartition和InputChannel都向LocalBufferPool申请Buffer空间，然后LocalBufferPool再向NetWork BufferPool申请内存空间。这里，NetWork BufferPool是TaskManager内所有Task共享的BufferPool，TaskManager初始化时就会向堆外内存申请NetWork BufferPool。LocalBufferPool是每个Task自己的BufferPool，假如一个TaskManager内运行着5个Task，那么就会有5个LocalBufferPool，但TaskManager内永远只有一个NetWork BufferPool。</p>
+<p>Netty的Buffer也是初始化时直接向堆外内存申请内存空间。虽然可以申请，但是必须明白内存申请肯定是有限制的，不可能无限制的申请，我们在启动任务时可以指定该任务最多可能申请多大的内存空间用于NetWorkBuffer。</p>
+<p>经过netty的buffer后，数据又会被拷贝到Socket的Send Buffer中，最后通过Socket发送网络请求，把Send Buffer中的数据发送到Consumer端的 Receive Buffer，并依图中所示，在Consumer端向上传递直到Consumer Operator。</p>
+<p>假设Producer端生产速率为2，Consumer端消费速率为1。那么一段时间后消费端（Task B）的Network buffer会打满，即使向LocalBufferPool和Network BufferPool申请可用的资源，也会逐渐被用完。由于Network buffer已满，Netty也就不会从receive buffer读数据了，也即socket到netty的数据传输会阻塞。这样receive buffer很快会用完，TCP的Socket通信有动态反馈的流控机制，会把容量为0的消息反馈给上游发送端，所以上游的Socket就不会往下游再发送数据了。Producer端从send buffer向上传递过程类似，直到network buffer无空间可用，RecordWriter输出就被wait，Task A不再生产数据。</p>
+<h3 id="TaskManager内部的反压过程"><a href="#TaskManager内部的反压过程" class="headerlink" title="TaskManager内部的反压过程"></a><strong>TaskManager内部的反压过程</strong></h3><img src="/.com//12/18/Flink%E4%B8%AD%E7%9A%84%E5%8F%8D%E5%8E%8B%E5%8E%9F%E7%90%86/%E5%86%85%E9%83%A8%E5%8F%8D%E5%8E%8B.webp" class title="内部反压">
+
+<p>下游的 TaskManager 反压导致本 TaskManager 的 ResultSubPartition 无法继续写入数据，于是 Record Writer 的写也被阻塞住了，因为 Operator 需要有输入才能有计算后的输出，输入跟输出都是在同一线程执行， Record Writer 阻塞了，Record Reader 也停止从 InputChannel 读数据，这时上游的 TaskManager 还在不断地发送数据，最终将这个 TaskManager 的 Buffer 耗尽。</p>
+<h2 id="Flink的Credit的反压过程"><a href="#Flink的Credit的反压过程" class="headerlink" title="Flink的Credit的反压过程"></a><strong>Flink的Credit的反压过程</strong></h2><img src="/.com//12/18/Flink%E4%B8%AD%E7%9A%84%E5%8F%8D%E5%8E%8B%E5%8E%9F%E7%90%86/Credit%E7%9A%84%E5%8F%8D%E5%8E%8B.webp" class title="Credit的反压">
+
+<p>还以之前的图为例，在每一次ResultSubPartition向InputChannel发送消息时，都会发送一个backlog size告诉下游准备发送多少消息，下游会计算 Buffer空间大小去接收消息，如果有充足的Buffer就返还给上游一个Credit告知可以发送消息的大小（图中ResultSubPartition和InputChannel之间的虚线表示最终还是需要通过Netty和Socket去通信，并不是直接通信）。</p>
+<p>相同的场景，上游生产的速率为2，下游消费的速率为1，这样InputChannel中的内存很快就会耗尽，通信过程中就会返回credit&#x3D;0给ResultSubPartition告知上游，下游已经没有空间了，上游也就不再继续发送数据给netty，直到下游消费给InputChannel腾出空间了，数据才会继续发送。</p>
+<p>基于credit的反压过程，效率比之前要高，因为只要下游InputChannel空间耗尽，就能通过credit让上游ResultSubPartition感知到，不需要在通过netty和socket层来一层一层的传递。另外，它还解决了由于一个Task反压导致 TaskManager和TaskManager之间的Socket阻塞的问题。</p>
+]]></content>
+      <tags>
+        <tag>Flink</tag>
+      </tags>
+  </entry>
+  <entry>
+    <title>Flink基础（上）</title>
+    <url>/2023/06/18/Flink%E5%9F%BA%E7%A1%80%EF%BC%88%E4%B8%8A%EF%BC%89/</url>
+    <content><![CDATA[<img src="/.com//06/18/Flink%E5%9F%BA%E7%A1%80%EF%BC%88%E4%B8%8A%EF%BC%89/v2-705f5f773faae54c8c6980895b64e8c5_1440w-1687076650734-3-1687076654856-5.webp" class title="img">
+]]></content>
+  </entry>
+</search>
